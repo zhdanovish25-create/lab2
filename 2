@@ -27,6 +27,12 @@ const unsigned long RED_TIME = 10000;
 const unsigned long PED_EXTRA_TIME = 5000;
 const unsigned long BLINK_INTERVAL = 500;
 const unsigned long DEBOUNCE_DELAY = 50;
+const unsigned long LONG_PRESS_TIME = 3000;
+
+struct Transition {
+  State nextState;
+  unsigned long duration;
+};
 
 State currentState = S_GREEN;
 unsigned long stateStartTime = 0;
@@ -34,19 +40,59 @@ unsigned long stateDuration = 0;
 bool pedRequest = false;
 bool emergency = false;
 bool nightMode = false;
+
 bool lastButtonState = HIGH;
 unsigned long lastDebounceTime = 0;
 bool buttonPressed = false;
+unsigned long buttonPressStart = 0;
+
 unsigned long lastBlinkTime = 0;
 bool yellowBlinkState = false;
+
+Transition stateTable[NUM_STATES][NUM_EVENTS] = {
+  {
+    {S_GREEN, GREEN_TIME},
+    {S_YELLOW, YELLOW_TIME},
+    {S_GREEN, GREEN_TIME},
+    {S_WARNING, BLINK_INTERVAL},
+    {S_GREEN, GREEN_TIME},
+    {S_WARNING, BLINK_INTERVAL}
+  },
+  {
+    {S_YELLOW, YELLOW_TIME},
+    {S_RED, RED_TIME},
+    {S_YELLOW, YELLOW_TIME},
+    {S_WARNING, BLINK_INTERVAL},
+    {S_YELLOW, YELLOW_TIME},
+    {S_WARNING, BLINK_INTERVAL}
+  },
+  {
+    {S_RED, RED_TIME},
+    {S_GREEN, GREEN_TIME},
+    {S_RED, RED_TIME},
+    {S_WARNING, BLINK_INTERVAL},
+    {S_RED, RED_TIME},
+    {S_WARNING, BLINK_INTERVAL}
+  },
+  {
+    {S_WARNING, BLINK_INTERVAL},
+    {S_WARNING, BLINK_INTERVAL},
+    {S_WARNING, BLINK_INTERVAL},
+    {S_WARNING, BLINK_INTERVAL},
+    {S_GREEN, GREEN_TIME},
+    {S_GREEN, GREEN_TIME}
+  }
+};
 
 void setup() {
   pinMode(RED_PIN, OUTPUT);
   pinMode(YELLOW_PIN, OUTPUT);
   pinMode(GREEN_PIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  
   Serial.begin(9600);
-  Serial.println("Светофор запущен - Классический метод");
+  Serial.println("Светофор запущен - Табличный метод");
+  
   goToState(S_GREEN, GREEN_TIME);
 }
 
@@ -55,6 +101,7 @@ void goToState(State newState, unsigned long duration) {
   stateStartTime = millis();
   stateDuration = duration;
   setOutputsForState(newState);
+  
   logStateTransition(newState);
 }
 
@@ -82,19 +129,19 @@ void setOutputsForState(State state) {
 }
 
 void logStateTransition(State newState) {
-  Serial.print("Переход в состояние: ");
+  Serial.print(millis());
+  Serial.print(" мс -> Переход: ");
   switch(newState) {
-    case S_GREEN: Serial.print("S_GREEN"); break;
-    case S_YELLOW: Serial.print("S_YELLOW"); break;
-    case S_RED: Serial.print("S_RED"); break;
-    case S_WARNING: Serial.print("S_WARNING"); break;
+    case S_GREEN: Serial.println("ЗЕЛЕНЫЙ"); break;
+    case S_YELLOW: Serial.println("ЖЕЛТЫЙ"); break;
+    case S_RED: Serial.println("КРАСНЫЙ"); break;
+    case S_WARNING: Serial.println("МИГАЮЩИЙ ЖЕЛТЫЙ"); break;
   }
-  Serial.print(" Время: ");
-  Serial.println(millis());
 }
 
-void readInputs() {
+Event readInputs() {
   int reading = digitalRead(BUTTON_PIN);
+  Event event = E_NONE;
   
   if (reading != lastButtonState) {
     lastDebounceTime = millis();
@@ -103,86 +150,101 @@ void readInputs() {
   if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
     if (reading == LOW && !buttonPressed) {
       buttonPressed = true;
-      pedRequest = true;
-      Serial.println("Событие: E_PED_REQ");
+      
+      if (!pedRequest) {
+        pedRequest = true;
+        Serial.println("Запрос пешехода зарегистрирован - зеленый догорит полный цикл");
+      }
     } else if (reading == HIGH) {
       buttonPressed = false;
     }
   }
   
-  lastButtonState = reading;
-  
   static unsigned long buttonPressStart = 0;
   if (reading == LOW && buttonPressStart == 0) {
     buttonPressStart = millis();
   }
-  if (reading == HIGH && buttonPressStart != 0) {
-    unsigned long pressDuration = millis() - buttonPressStart;
-    if (pressDuration > 3000) {
+  if (reading == HIGH && buttonPressStart != 0) {unsigned long pressDuration = millis() - buttonPressStart;
+    if (pressDuration > LONG_PRESS_TIME) {
       nightMode = !nightMode;
+      event = E_NIGHT_MODE_TOGGLE;
       Serial.print("Ночной режим: ");
       Serial.println(nightMode ? "ВКЛ" : "ВЫКЛ");
     }
     buttonPressStart = 0;
   }
+  
+  lastButtonState = reading;
+  return event;
 }
 
-void loop() {
-  readInputs();
+void processEvent(Event event) {
+  if (event == E_NONE) return;
   
-  if (emergency) {
-    if (currentState != S_WARNING) {
-      goToState(S_WARNING, BLINK_INTERVAL);
-    }
-  } else if (nightMode) {
-    if (currentState != S_WARNING) {
-      goToState(S_WARNING, BLINK_INTERVAL);
-    }
-  }
+  Transition transition = stateTable[currentState][event];
   
   switch(currentState) {
     case S_GREEN:
-      if (millis() - stateStartTime >= stateDuration) {
-        if (pedRequest) {
-          goToState(S_YELLOW, YELLOW_TIME);
-        } else {
-          goToState(S_YELLOW, YELLOW_TIME);
-        }
+      if (event == E_TIMER_EXPIRE && pedRequest) {
+        transition.nextState = S_YELLOW;
+        transition.duration = YELLOW_TIME;
+        Serial.println("Зеленый догорел - переход к желтому с учетом запроса пешехода");
       }
       break;
       
     case S_YELLOW:
-      if (millis() - stateStartTime >= stateDuration) {
-        if (pedRequest) {
-          pedRequest = false;
-          goToState(S_RED, RED_TIME + PED_EXTRA_TIME);
-        } else {
-          goToState(S_RED, RED_TIME);
-        }
-      }
-      break;
-      
-    case S_RED:
-      if (millis() - stateStartTime >= stateDuration) {
-        goToState(S_GREEN, GREEN_TIME);
+      if (event == E_TIMER_EXPIRE && pedRequest) {
+        transition.nextState = S_RED;
+        transition.duration = RED_TIME + PED_EXTRA_TIME;
+        pedRequest = false;
+        Serial.println("Дополнительное время для пешеходов");
       }
       break;
       
     case S_WARNING:
-      if (millis() - lastBlinkTime >= BLINK_INTERVAL) {
-        yellowBlinkState = !yellowBlinkState;
-        digitalWrite(YELLOW_PIN, yellowBlinkState ? HIGH : LOW);
-        lastBlinkTime = millis();
+      if (event == E_EMERGENCY_OFF && nightMode) {
+        transition.nextState = S_WARNING;
+        transition.duration = BLINK_INTERVAL;
       }
-      
-      if (!emergency && !nightMode) {
-        goToState(S_GREEN, GREEN_TIME);
+      if (event == E_NIGHT_MODE_TOGGLE && !nightMode) {
+        transition.nextState = S_GREEN;
+        transition.duration = GREEN_TIME;
       }
       break;
   }
   
+  if (transition.nextState != currentState) {
+    goToState(transition.nextState, transition.duration);
+  }
+}
+
+void loop() {
+  Event event = readInputs();
+  
+  static bool lastEmergency = false;
+  if (emergency && !lastEmergency) {
+    processEvent(E_EMERGENCY_ON);
+  } else if (!emergency && lastEmergency) {
+    processEvent(E_EMERGENCY_OFF);
+  }
+  lastEmergency = emergency;
+  
+  if (millis() - stateStartTime >= stateDuration) {
+    processEvent(E_TIMER_EXPIRE);
+  }
+  
+  processEvent(event);
+  
+  if (currentState == S_WARNING) {
+    if (millis() - lastBlinkTime >= BLINK_INTERVAL) {
+      yellowBlinkState = !yellowBlinkState;
+      digitalWrite(YELLOW_PIN, yellowBlinkState ? HIGH : LOW);
+      lastBlinkTime = millis();
+    }
+  }
+  
   static unsigned long lastEmergencyToggle = 0;
-  if (millis() - lastEmergencyToggle > 15000) {
+  if (millis() - lastEmergencyToggle > 28000) {
     emergency = !emergency;
     Serial.print("Аварийный режим: ");
     Serial.println(emergency ? "ВКЛ" : "ВЫКЛ");
